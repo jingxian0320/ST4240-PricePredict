@@ -1,0 +1,164 @@
+---
+title: "Basic Data Exploration and Prediction"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+setwd("~/Desktop/Data Mining 2017")
+filename_train = "train.csv"
+filename_test = "test.csv"
+train = read.csv(file = filename_train)
+test = read.csv(file = filename_test)
+```
+
+#Exploratory Data Analysis
+
+```{r exploration}
+set.seed(1234) #for reproducibility
+library(plyr)
+library(dplyr, warn.conflicts = FALSE)
+library(ggplot2)
+train %>% 
+  ggplot() + geom_point(aes(x=x, y=y, colour=price/living_area),alpha=0.3) +
+  scale_colour_gradient(low = "blue", high="red")
+
+train %>%                                       
+  ggplot(aes(x=factor(bedrooms), y=living_area)) +                   
+  geom_boxplot() 
+
+train %>%                                       
+  ggplot(aes(x=factor(bathrooms), y=living_area)) +                   
+  geom_boxplot() 
+
+
+library("hexbin")
+train %>%                                       
+  ggplot(aes(x=living_area,y=price)) + 
+  stat_binhex(bins=50)
+```
+
+# Data Preprocessing
+
+```{r Data Preprocessing}
+names(train)
+str(train)
+str(test)
+train = read.csv("train.csv", stringsAsFactors = FALSE) 
+test = read.csv("test.csv", stringsAsFactors = FALSE)
+price = train$price
+# Remove the target variable not found in test set
+train$price = NULL
+# Remove Id since it should have no value in prediction
+train$Id = NULL    
+test$Id = NULL
+# Combine data sets
+full_data = rbind(train,test)
+# Convert character columns to factor, filling NA values with "missing"
+# Convert character columns to factor, filling NA values with "missing"
+for (col in colnames(full_data)){
+  if (typeof(full_data[,col]) == "character"){
+    new_col = full_data[,col]
+    new_col[is.na(new_col)] = "missing"
+    full_data[col] = as.factor(new_col)
+  }
+}
+# Separate out our train and test sets
+train = full_data[1:nrow(train),]
+train$price = price  
+test = full_data[(nrow(train)+1):nrow(full_data),]
+
+summary(train)
+# Fill remaining NA values with -1
+train[is.na(train)] = -1
+test[is.na(test)] = -1
+cors = cor(train[ , sapply(train, is.numeric)])
+high_cor = which(abs(cors) > 0.6 & (abs(cors) < 1))
+rows = rownames(cors)[((high_cor-1) %/% 38)+1]
+cols = colnames(cors)[ifelse(high_cor %% 38 == 0, 38, high_cor %% 38)]
+vals = cors[high_cor]
+
+cor_data = data.frame(cols=cols, rows=rows, correlation=vals)
+cor_data
+
+# Let's explore the distributions of the numeric variables with density plots
+for (col in colnames(train)){
+  if(is.numeric(train[,col])){
+    plot(density(train[,col]), main=col)
+  }
+}
+# Add variable that combines living area with basement
+train$total_sq_footage = train$living_area + train$basement
+test$total_sq_footage = test$living_area + test$basement
+```
+
+# Predictive Modelling: Linear Regression
+
+Let us fit the simplest possible model: linear regression (without any regularization or more fancy tweaks)
+```{r linear regression}
+linear_model = lm(price ~ ., data = train)
+linear_model_pred_test = predict.lm(linear_model, newdata = test)
+linear_model_pred_train = predict.lm(linear_model, newdata = train)
+#for sanity check, let us make sure that this gives
+# sensible result on the training set
+plot(train[,"price"], linear_model_pred_train, main="Prediction Training Set")
+abline(a = 0, b=1, col="red", lwd=3, lty=2)
+#everything is roughly fine. There is a nice positive correlation
+#(even though some predicted price are negative!)
+```
+
+#Predictive Modelling: XGBoost Tree Model
+
+Let us fit the Prediction model: XGBoost
+```{r prediction}
+library(caret)
+library(xgboost)
+library(Metrics)
+
+# Create custom summary function in proper format for caret
+custom_summary = function(data, lev = NULL, model = NULL){
+  out = rmsle(data[, "obs"], data[, "pred"])
+  names(out) = c("rmsle")
+  out
+}
+# Create control object
+control = trainControl(method = "cv",  # Use cross validation
+                       number = 5,     # 5-folds
+                       summaryFunction = custom_summary                      
+)
+# Create grid of tuning parameters
+grid = expand.grid(nrounds=c(100, 200, 400, 800), # Test 4 values for boosting rounds
+                   max_depth= c(4, 6),           # Test 2 values for tree depth
+                   eta=c(0.1, 0.05, 0.025),      # Test 3 values for learning rate
+                   gamma= c(0.1), 
+                   colsample_bytree = c(1), 
+                   min_child_weight = c(1),
+                   subsample = c(1, .6, .9))
+set.seed(12)
+xgb_tree_model =  train(price~.,      # Predict Price using all features
+                        data=train,
+                        method="xgbTree",
+                        trControl=control, 
+                        tuneGrid=grid, 
+                        metric="rmsle", # Use custom performance metric
+                        maximize = FALSE)   # Minimize the metric
+xgb_tree_model$results
+xgb_tree_model$bestTune
+varImp(xgb_tree_model)
+
+#let's make predictions on the test set using the trained model
+test_predictions = predict(xgb_tree_model, newdata=test)
+
+#let's create a submission file
+submission = read.csv("linear_model_prediction.csv")
+submission$Prediction = test_predictions
+
+#let us create the submission file
+write.csv(x = submission,
+          file = "Prediction_Prices_10.csv",
+          row.names = FALSE)
+
+```
